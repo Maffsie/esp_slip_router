@@ -24,36 +24,71 @@
  *    life for the user easier, but does not seem worthwhile implementing here
  *
  * References used while building this emulator:
- * https://en.wikipedia.org/wiki/Hayes_AT_command_set
- * https://support.usr.com/support/756/756-ug/six.html
- * https://github.com/86Box/86Box/blob/master/src/network/net_modem.c
+ * https://en.wikipedia.org/wiki/Hayes_AT_command_set (background research, command reference)
+ * https://support.usr.com/support/756/756-ug/six.html (command reference)
+ * https://github.com/86Box/86Box/blob/master/src/network/net_modem.c (basic understanding of how AT command parsing can be done)
+ * https://opensource.apple.com/source/X11/X11-0.40/xc/programs/Xserver/hw/xfree86/input/mouse/pnp.c.auto.html (for understanding how PnP checksums work)
+ * My friend June's serial outputs from her USRobotics dingus. Thanks <3
  */
 
 sysconfig_p config;
 hayes_t modem;
 
+LOCAL void ICACHE_FLASH_ATTR h_init_pnp() {
+  // Build the P'n'P Identification string (ATI9)
+  modem.id = (pnp_t) {
+    .begin = '(', // Static
+    .upper_rev = 0x01,
+    .lower_rev = 0x24,
+    // EISA ID is assigned by a governing body, but I haven't heard of them
+    //  which makes me think this is something nobody has touched in decades
+    .eisa_id = "ESP",
+    .prod_id = "ESRH", // ESP SLIP Router - Hayes
+    .serial_no = "00000000", // WiFi MAC address?
+    .class_id = "MODEM",
+    .device_id = "ESPESRH,ATM1152",
+    .user_name = "esp-slip-router Hayes-compatible modem",
+    // Mod-8 of characters, as hex, MSD first
+    .checksum = "00",
+    .end = ')' // Static
+  };
+}
 void ICACHE_FLASH_ATTR h_init(sysconfig_p cfg) {
+  // Hayes Initialise - set everything to a known state
   config = cfg;
-  modem = (hayes_t){.prefs={0},.state={0}};
-  modem.prefs.echo = true;
-  modem.prefs.report = 7;
-  modem.prefs.verbose = true;
+  modem = (hayes_t){.id={0},.prefs={0},.state={0}};
+  h_init_pnp();
+  modem.prefs.echo = true; // E1
+  modem.prefs.report = 7; // X7
+  modem.prefs.verbose = true; //V1
   // Register settings
-  modem.prefs.regs[2] = ESC_CHR;
-  modem.prefs.regs[3] = CR;
-  modem.prefs.regs[4] = LF;
-  modem.prefs.regs[5] = BS;
-  modem.prefs.regs[6] = 2;
-  modem.prefs.regs[7] = 60;
-  modem.prefs.regs[8] = 2;
-  modem.prefs.regs[9] = 6;
-  modem.prefs.regs[10] = 7;
-  modem.prefs.regs[11] = 70;
-  modem.prefs.regs[12] = 50;
-  modem.prefs.regs[21] = 10;
-  modem.prefs.regs[22] = DC1;
-  modem.prefs.regs[23] = DC3;
-  modem.prefs.regs[25] = 5;
+  REG_ESC = ESC_CHR; // Escape character, default +
+  REG_CR = CR; // Carriage return character
+  REG_LF = LF; // Linefeed character
+  REG_BS = BS; // Backspace character
+  REG_XON = DC1; // Software flow control on
+  REG_XOFF = DC3; // Software flow control off
+  
+  // S0: Auto-answer after N rings
+  // S1: Count and store rings from inbound calls
+  REG_S(6) = 2;   // S6, 
+  REG_S(7) = 60;  // S7,  Wait time for carrier signal, seconds.
+  REG_S(8) = 2;   // S8:  Pause time for each comma in dialstring, seconds.
+  REG_S(9) = 6;   // S9:  Carrier detect time, 1/10th second.
+  REG_S(10) = 7;  // S10: Carrier loss wait time, 1/10th second
+  REG_S(11) = 70; // S11: Tone duration and interval, milliseconds.
+  REG_S(12) = 50; // S12: Escape code guard time, half-seconds.
+  // S19: Inactivity/hang-up timer
+  REG_S(21) = 10; // S21: Break time, 1/100th second.
+  // S24: Pulsed DSR duration, 1/50th second.
+  REG_S(25) = 5;  // S25: DTR recognition time, 1/100th second.
+  // S26: RTS/CTS delay time, 1/100th second
+  // S38: Disconnect wait time, seconds.
+  // S41: Allowable remote log-in attempts.
+  // S42: Remote access ASCII character
+  // S43: Remote guard time, 1/5th second.
+  // S44: Leased line delay timer
+  
   if(HAYES_CMD_MODE_AT_BOOT)
     modem.state.on_hook = true;
   else {
@@ -63,15 +98,19 @@ void ICACHE_FLASH_ATTR h_init(sysconfig_p cfg) {
   }
 }
 LOCAL bool ICACHE_FLASH_ATTR h_is_num(char c) {
+  // Basic ASCII is-numeric test
   return c > 47 && c < 59;
 }
 static uint8_t ICACHE_FLASH_ATTR h_parse_num(char c) {
+  // Basic single-char atoi
+  //  intended for use after validating with h_is_num(char)
   return c-48;
 }
 LOCAL uint8_t ICACHE_FLASH_ATTR h_multi_parse_num(uint8_t i) {
+  // Multiple-digit parser. Gross, but I'm not confident with strcpy/etc
+  //  so this absolutely can and should be improved. An atoi() analogue should
+  //  never be this bad.
   uint8_t n = 0;
-  // This just feels real gross but,. eh.
-  // Validate first number
   if(!h_is_num(modem.state.cmdbuf[i])) return 0;
   if(i+1 < modem.state.cmd_i && h_is_num(modem.state.cmdbuf[i+1])) {
     if(i+2 < modem.state.cmd_i && h_is_num(modem.state.cmdbuf[i+2]))
@@ -82,40 +121,74 @@ LOCAL uint8_t ICACHE_FLASH_ATTR h_multi_parse_num(uint8_t i) {
   return n;
 }
 LOCAL void ICACHE_FLASH_ATTR h_echo(char c) {
+  // Character echo
+  // Controlled by ATE command
   if(!modem.prefs.echo) return;
   // LF is swallowed if last character was CR
   if(c == REG_LF && modem.state.l_chr == REG_CR) return;
-  uart_tx_one_char(UART0, c);
+  CHAR_OUT(c);
 }
 LOCAL void ICACHE_FLASH_ATTR h_print_nocr(char s[]) {
+  // Stupid-simple print function.
   uint16_t i=0;
   uint16_t sz=os_strlen(s);
   while(i<sz)
-    uart_tx_one_char(UART0, s[i++]);
+    CHAR_OUT(s[i++]);
 }
 LOCAL void ICACHE_FLASH_ATTR h_print(char s[]) {
+  // Wrapper around h_print_nocr to end it with a CR
   h_print_nocr(s);
-  uart_tx_one_char(UART0, REG_CR);
+  CHAR_OUT(REG_CR);
 }
 LOCAL void h_print_i(uint8_t n) {
+  // Print an integer
+  // This feels like a wildly inefficient way of accomplishing this.
   char s[4]; // uint8_t can at most be 255, + NUL
   os_sprintf(s, "%u", n);
   h_print(s);
 }
 LOCAL void ICACHE_FLASH_ATTR h_print_h(char suffix[]) {
+  // Used for ATI commands as a header
   char str[60];
   os_sprintf(str, "%s %s", S_ID, suffix);
   h_print(str);
 }
+LOCAL void ICACHE_FLASH_ATTR h_serialise_pnp(char *buffer[]) {
+  char pnpstr[256]; // PNP spec says this may be up to 256 chars
+  // (1.0ESPESRH\01234567\MODEM\PNPC10E,PNPC103,PNPC107,PNPC10F\esp-slip-router Hayes-compatible modem\XX)
+  /*
+  // The following commented out until I can figure out how this checksum stuff works
+  os_sprintf(pnpstr, "%c%u%u%s%s\%s\%s\%s\%s\%c",
+  modem.id.begin,
+  modem.id.upper_rev, modem.id.lower_rev,
+  modem.id.eisa_id, modem.id.prod_id,
+  modem.id.serial_no,
+  modem.id.class_id,
+  modem.id.device_id,
+  modem.id.user_name,
+  modem.id.end);
+  uint8_t rem = uint8_t len = os_strlen(pnpstr);
+  uint8_t sum = 0;
+  while(--rem>=0)
+    sum += pnpstr[(len-1)-rem];
+  */
+  os_sprintf(buffer, "%c%u%u%s%s%c%c%s%c%s%c",
+  PNP_BEGIN, modem.id.upper_rev, modem.id.lower_rev,
+  modem.id.eisa_id, modem.id.prod_id, PNP_EXTRA, PNP_EXTRA,
+  modem.id.class_id, PNP_EXTRA, modem.id.device_id, PNP_END);
+}
 LOCAL void ICACHE_FLASH_ATTR h_result_connbaud() {
-  if(modem.prefs.quiet) return;
-  if(modem.prefs.verbose) {
+  // Method to output the correct result upon connecting
+  if(modem.prefs.quiet) return; // controlled by ATQ
+  if(modem.prefs.verbose) { // controlled by ATV
+    // Prints "CONNECT <baudrate>"
     char connstr[15];
     os_sprintf(connstr, RESP_CONBAUD, config->bit_rate);
     h_print(connstr);
     return;
   }
-  switch(config->bit_rate) {
+  switch(config->bit_rate) { // if ATV0 and ATQ0, map baudrate to response code
+    // TODO: Baud rates above 56000 - USRobotics' docs don't include this.
     case 56000: h_print_i(232); break;
     case 54666: h_print_i(228); break;
     case 53333: h_print_i(224); break;
@@ -145,17 +218,20 @@ LOCAL void ICACHE_FLASH_ATTR h_result_connbaud() {
     case  1200: h_print_i( 15); break;
     case  9600: h_print_i( 13); break;
     case  2400: h_print_i( 10); break;
+    // If baud rate can't be mapped to a code, just return CONNECT
     default   : h_print_i(1);
   }
 }
 LOCAL void ICACHE_FLASH_ATTR h_result_send(char verbose[], uint8_t code) {
+  // Method to print either the result code, or the result string,
+  //  respecting the EQV settings.
   if(modem.prefs.quiet) return;
   if(modem.prefs.verbose) h_print(verbose);
   else h_print_i(code);
 }
 void ICACHE_FLASH_ATTR h_result(hayes_result_t res) {
+  // Maps a result to a string/numeric result code.
   if(modem.prefs.quiet) return;
-  char output[20]; // can't declare inside a switch block
   switch(res) {
     case OKAY:
       h_result_send(RESP_OK, 0);
@@ -188,12 +264,22 @@ void ICACHE_FLASH_ATTR h_result(hayes_result_t res) {
       h_result_send(RESP_RR, 11);
       break;
     default:
-      os_sprintf(output, "????? %u", res);
-      h_print(output);
+      {
+        char output[20];
+        os_sprintf(output, "????? %u", res);
+        h_print(output);
+      }
   }
 }
 LOCAL void ICACHE_FLASH_ATTR h_dial(bool go_online) {
   // Handle "dialling".
+  /*
+   * TODO:
+   * Check if wifi connection is established
+   * Return NO_CARRIER or NO_DIAL_TONE if not
+   * But only if the dialled number isn't something documented
+   *  (for configuring via telnet)
+   */
   modem.state.in_call = true;
   modem.state.online = go_online;
   h_result(CONNECT_BAUD);
@@ -205,9 +291,17 @@ LOCAL void ICACHE_FLASH_ATTR h_dial(bool go_online) {
 //  letter if the desired effect is to set them to false.
 // Commands that will terminate the command parse process are prefixed 'ht_'
 LOCAL void ICACHE_FLASH_ATTR ht_ATDOLLAR() {
+  // AT$ - List all supported commands
   h_result(OKAY);
 }
 LOCAL void ICACHE_FLASH_ATTR ht_ATAMPDOLLAR() {
+  // AT&$ - List all available vendor commands
+  // TODO.
+  h_result(OKAY);
+}
+LOCAL void ICACHE_FLASH_ATTR ht_ATEXTDOLLAR() {
+  // AT+$ - List all available extended commands
+  // TODO.
   h_result(OKAY);
 }
 LOCAL void ICACHE_FLASH_ATTR hz_ATA() {
@@ -220,23 +314,30 @@ LOCAL void ICACHE_FLASH_ATTR hz_ATA() {
 LOCAL bool ICACHE_FLASH_ATTR h_ATA(char a) {
   // ATA0 - Answer 0
   // Possibly the argument here is for if you have more than one line/"call"?
+  // Just maps to off-hook, in-call for now.
+  if(a != '0') return false;
   modem.state.on_hook=false;
   modem.state.in_call=true;
   h_result(OKAY);
-  return a == '0';
+  return true;
 }
 LOCAL void ICACHE_FLASH_ATTR ht_ATDDOLLAR() {
+  // ATD$ - List all available dial commands
+  // TODO.
   h_result(OKAY);
 }
 LOCAL void ICACHE_FLASH_ATTR ht_ATDL() {
+  // ATDL - Redial last dialled number
   modem.state.on_hook = false;
   h_dial(true);
 }
 LOCAL uint8_t ICACHE_FLASH_ATTR ht_ATDN(uint8_t i) {
+  // ATD[PRT] - Dial touch-tone, pulse or originate-only line
   uint8_t taken = 1;
   uint8_t pause_time = 0;
   modem.state.on_hook = false;
   bool go_online = true;
+  // TODO: Store "dialled" number somewhere, implement pauses
   while(i+taken<modem.state.cmd_i) {
     if(!h_is_num(modem.state.cmdbuf[i+taken]) &&
       modem.state.cmdbuf[i+taken] != ',' && // 2s pause before resuming dial
@@ -284,7 +385,7 @@ LOCAL uint8_t ICACHE_FLASH_ATTR ht_ATD(uint8_t i) {
     case 'R': // Dial an originate-only modem
     case 'T': // Touch-tone dial
       return ht_ATDN(i);
-    case 'S':
+    case 'S': // Dial a stored number
       h_result(ERROR);
       return 1;
     case '$':
@@ -316,12 +417,13 @@ LOCAL void ICACHE_FLASH_ATTR hz_ATI() {
 }
 LOCAL void ICACHE_FLASH_ATTR ht_ATI(uint8_t i) {
   // ATI0-11 - Inform, Inquire, Interrogate
+  // Outputs various information about the modem, its state, configuration, etc
   if(!h_is_num(modem.state.cmdbuf[i])) {
     h_result(ERROR);
     return;
   }
   uint8_t method = h_multi_parse_num(i);
-  char outstr[60];
+  char outstr[256];
   uint8_t iter=0;
   switch(method) {
     case 0:
@@ -330,10 +432,12 @@ LOCAL void ICACHE_FLASH_ATTR ht_ATI(uint8_t i) {
       break;
     case 1:
       // ATI1 - ROM Checksum (4 characters)
+      // TODO: This should be an actual checksum of the ESP's flash.
       h_print("A0B1");
       break;
     case 2:
       // ATI2 - RAM test results
+      // Just outputs "OK".
       break;
     case 3:
       // ATI3 - Firmware version
@@ -341,22 +445,46 @@ LOCAL void ICACHE_FLASH_ATTR ht_ATI(uint8_t i) {
       break;
     case 4:
       // ATI4 - Settings
+      // TODO.
       /*
        * Lists states for B, C, E, F, L, M, Q, V and X settings
        * Lists baud, parity, length
-       * "DIAL=HUNT"? "ON HOOKAY" "TIMER"
+       * "DIAL=HUNT"? "ON HOOK" "TIMER"
        * Lists states for &A, B, C, D, ...
        * Lists register states
        * Lists last dialed number
        */
+      h_print_h("Settings...");
+      // Basic settings/state
+      os_sprintf(outstr,
+      "E%u L2 M1 Q%u V%u X%u%c"
+      "BAUD=%u PARITY=N WORDLEN=8%c"
+      "DIAL=HUNT O%s HOOK TIMER%c",
+      modem.prefs.echo, modem.prefs.quiet, modem.prefs.verbose,
+      modem.prefs.report, REG_CR,
+      config->bit_rate, REG_CR,
+      modem.state.on_hook? "N " : "FF", REG_CR);
+      h_print(outstr);
+      // Registers
+      os_sprintf(outstr,
+        "S00=%03u  S01=%03u  S02=%03u  S03=%03u  S04=%03u  S05=%03u  S06=%03u  S07=%03u",
+        REG_E(0), REG_E(1), REG_E(2), REG_E(3), REG_E(4), REG_E(5), REG_E(6), REG_E(7));
+      os_sprintf(outstr,
+        "S00=%03u  S01=%03u  S02=%03u  S03=%03u  S04=%03u  S05=%03u  S06=%03u  S07=%03u",
+        REG_E(0), REG_E(1), REG_E(2), REG_E(3), REG_E(4), REG_E(5), REG_E(6), REG_E(7));
+      os_sprintf(outstr,
+        "S00=%03u  S01=%03u  S02=%03u  S03=%03u  S04=%03u  S05=%03u  S06=%03u  S07=%03u",
+        REG_E(0), REG_E(1), REG_E(2), REG_E(3), REG_E(4), REG_E(5), REG_E(6), REG_E(7));
       break;
     case 5:
       // ATI5 - NVRAM Settings
+      // TODO after preservation of settings is implemented.
       // lists most of the same as above but also phonebook and extra settings
       // also stored command(?)
       break;
     case 6:
       // ATI6 - Link diagnostics
+      // TODO.
       // Chars, Octets, Blocks sent/recv
       // Chars lost
       // Blocks resent
@@ -368,11 +496,18 @@ LOCAL void ICACHE_FLASH_ATTR ht_ATI(uint8_t i) {
       break;
     case 7:
       // ATI7 - configuration profile
+      // Not sure what this would map to, it should probably just return ERROR
       break;
     // ATI8 - (riker voice) that never happened.
     case 9:
-      // ATI9 - some kind of plug'n'play string?
-      // (1.0USR00BA\\MODEM\PNPC107\USRobotics Courier V.Everything EXT)
+      // ATI9 - Plug'n'Play string
+      /*
+       * Per MS' External COM Device Specification, 0.99D, 17th Feb., 1995
+       * PnP can be implemented as a state machine I think, but may not be
+       *  worthwhile to really do properly.
+       */
+       h_serialise_pnp(&outstr);
+       h_print(outstr);
       break;
     case 10:
       // ATI10 - Dial security status
@@ -399,9 +534,9 @@ LOCAL void ICACHE_FLASH_ATTR ht_ATI(uint8_t i) {
         os_sprintf(outstr, "%u: %c (%u, %x)    ", iter, modem.state.cmdbuf[iter], modem.state.cmdbuf[iter], modem.state.cmdbuf[iter]);
         h_print_nocr(outstr);
         if(iter++%4==0)
-          uart_tx_one_char(UART0, REG_CR);
+          CHAR_OUT(REG_CR);
       }
-      uart_tx_one_char(UART0, REG_CR);
+      CHAR_OUT(REG_CR);
       os_sprintf(outstr, "cmdbuf index %u, last %u, lchr %c",
                  modem.state.cmd_i, modem.state.l_cmd_i,
                  modem.state.l_chr);

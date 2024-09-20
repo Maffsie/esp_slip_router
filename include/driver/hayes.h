@@ -20,16 +20,32 @@
 #define HAYES_CMD_MODE_AT_BOOT true
 #endif
 
+// Macros
+// Shorthand for writing a character out
+#define CHAR_OUT(c) uart_tx_one_char(UART0, ##c)
+// Shorthand for accessing a register
+#define REG_S(register) modem.prefs.regs[##register]
+
+// Shorthand definitions
 #define BS 8
 #define CR 13
 #define LF 10
 #define DC1 17
 #define DC3 19
 #define ESC_CHR 43
-#define REG_ESC modem.prefs.regs[2]
-#define REG_CR modem.prefs.regs[3]
-#define REG_LF modem.prefs.regs[4]
-#define REG_BS modem.prefs.regs[5]
+
+// PnP constants
+#define PNP_BEGIN 0x28
+#define PNP_EXTRA 0x5C
+#define PNP_END 0x29
+
+// Named registers
+#define REG_ESC REG_S(2)
+#define REG_CR REG_S(3)
+#define REG_LF REG_S(4)
+#define REG_BS REG_S(5)
+#define REG_XON REG_S(22)
+#define REG_XOFF REG_S(23)
 
 static char ERR_NOTIMPL[] = "Not implemented";
 
@@ -63,6 +79,20 @@ typedef enum {
 } hayes_result_t;
 
 typedef struct {
+  char begin;
+  uint8_t upper_rev;
+  uint8_t lower_rev;
+  char eisa_id[3];
+  char prod_id[4];
+  char serial_no[8];
+  char class_id[32];
+  char driver_id[40];
+  char user_name[40];
+  char checksum[2];
+  char end;
+} pnp_t;
+
+typedef struct {
   bool echo:1;
   bool quiet:1;
   unsigned int report:3; // ATX0-4 report levels
@@ -90,6 +120,7 @@ typedef struct {
 typedef struct {
   h_prefs_t prefs;
   h_state_t state;
+  pnp_t id;
 } hayes_t;
 
 void h_init(sysconfig_p);
